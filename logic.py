@@ -35,8 +35,10 @@ MAX_DEPTH = 8  # iterative deepening rarely reaches this; the clock stops us
 # --- Leaf-evaluation weights ------------------------------------------------
 ALIVE_BONUS = 1_000_000
 DEAD_PENALTY = -1_000_000
-SPACE_WEIGHT = 120
-TRAP_PENALTY = 30_000
+SPACE_WEIGHT = 40           # my raw reachable space (Voronoi is the main term)
+TRAP_PENALTY = 30_000       # reachable space < body and no tail escape
+VOR_WEIGHT = 60             # per-cell territory differential (squeeze driver)
+SQUEEZE_BONUS = 40_000      # enemy territory smaller than enemy body: he's dying
 LENGTH_WEIGHT = 400
 LEAD_WEIGHT = 300           # reward being longer than the biggest enemy
 ENEMY_ALIVE_PENALTY = 600   # fewer live enemies is better
@@ -55,7 +57,7 @@ def get_info() -> Dict[str, str]:
         "color": "#00c896",
         "head": "smart-caterpillar",
         "tail": "weight",
-        "version": "2.0.0",
+        "version": "3.0.0",
     }
 
 
@@ -358,14 +360,27 @@ def _evaluate(state: Dict, my_id: str) -> float:
     my_len = len(me["body"])
     enemies = [s for s in state["snakes"] if s["id"] != my_id]
 
-    blocked = _blocked(state)
+    free_at = _free_at(state)
     score = float(ALIVE_BONUS)
 
-    # Reachable space (survival). Trapping ourselves is close to death.
-    space = _flood_fill(head, blocked, W, H, cap=W * H)
+    # My reachable space, honest about tails vacating over time. Reaching our
+    # own tail is a guaranteed survival loop, so it waives the trap penalty.
+    space, tail_ok = _tfill(head, free_at, W, H, tail=me["body"][-1])
     score += space * SPACE_WEIGHT
-    if space <= my_len:
+    if space <= my_len and not tail_ok:
         score -= TRAP_PENALTY
+
+    # Territory control (Voronoi): cells I reach before every enemy vs cells
+    # some enemy reaches before me. Maximizing the differential squeezes the
+    # opponent into a shrinking region until he seals himself.
+    if enemies:
+        my_terr, enemy_terr = _voronoi(state, my_id, free_at)
+        score += (my_terr - enemy_terr) * VOR_WEIGHT
+        for s in enemies:
+            # A squeezed enemy (territory smaller than his body) is dying.
+            if enemy_terr <= len(s["body"]):
+                score += SQUEEZE_BONUS
+                break
 
     # Length and lead over the biggest enemy.
     score += my_len * LENGTH_WEIGHT
@@ -374,13 +389,126 @@ def _evaluate(state: Dict, my_id: str) -> float:
         score += (my_len - biggest) * LEAD_WEIGHT
     score -= len(enemies) * ENEMY_ALIVE_PENALTY
 
-    # Food: pull toward it, urgently when hungry.
+    # Food: urgent when hungry, important while not the longest (length is
+    # what lets us win head-to-heads and squeeze), relaxed once we lead.
     if state["food"]:
         nearest = min(_manhattan(head, f) for f in state["food"])
-        urgency = FOOD_WEIGHT * 4 if me["health"] < HUNGRY_THRESHOLD else FOOD_WEIGHT
+        if me["health"] < HUNGRY_THRESHOLD:
+            urgency = FOOD_WEIGHT * 4
+        elif enemies and my_len <= max(len(s["body"]) for s in enemies):
+            urgency = FOOD_WEIGHT * 2
+        else:
+            urgency = FOOD_WEIGHT // 2
         score += (W + H - nearest) * urgency
 
     return score
+
+
+# ---------------------------------------------------------------------------
+# Time-aware space: body cells vacate as tails move
+# ---------------------------------------------------------------------------
+
+def _free_at(state: Dict) -> Dict[Point, int]:
+    """Map occupied cell -> number of turns until it becomes free.
+
+    Segment i of an L-long body vacates after L - i turns (tail first). If the
+    snake just ate (stacked tail), everything stays one turn longer. Future
+    eating is ignored — a good, cheap approximation.
+    """
+    free_at: Dict[Point, int] = {}
+    for s in state["snakes"]:
+        body = s["body"]
+        L = len(body)
+        grow = 1 if L >= 2 and body[-1] == body[-2] else 0
+        for i, seg in enumerate(body):
+            t = L - i + grow
+            if seg not in free_at or free_at[seg] < t:
+                free_at[seg] = t
+    return free_at
+
+
+def _tfill(start: Point, free_at: Dict[Point, int], W: int, H: int,
+           tail: Optional[Point] = None) -> Tuple[int, bool]:
+    """BFS where a body cell is passable once its occupant has vacated.
+
+    Returns (reachable cell count, reached own tail?).
+    """
+    if not (0 <= start[0] < W and 0 <= start[1] < H):
+        return 0, False
+    if free_at.get(start, 0) > 1:
+        return 0, False
+    seen = {start}
+    queue = deque([(start, 1)])
+    count = 0
+    tail_ok = False
+    while queue:
+        (x, y), t = queue.popleft()
+        count += 1
+        if tail is not None and (x, y) == tail:
+            tail_ok = True
+        for dx, dy in DIRECTIONS.values():
+            nbr = (x + dx, y + dy)
+            if nbr in seen or not (0 <= nbr[0] < W and 0 <= nbr[1] < H):
+                continue
+            if free_at.get(nbr, 0) > t + 1:
+                continue  # still occupied when we would arrive
+            seen.add(nbr)
+            queue.append((nbr, t + 1))
+    return count, tail_ok
+
+
+def _voronoi(state: Dict, my_id: str, free_at: Dict[Point, int]) -> Tuple[int, int]:
+    """Simultaneous BFS from all heads; each cell goes to whoever arrives
+    first (tie -> the longer snake, equal -> nobody). Returns (mine, theirs).
+    """
+    W, H = state["W"], state["H"]
+    lengths = {s["id"]: len(s["body"]) for s in state["snakes"]}
+    owner: Dict[Point, str] = {}
+    dist: Dict[Point, int] = {}
+    frontier: List[Tuple[Point, str]] = []
+    for s in state["snakes"]:
+        h = s["body"][0]
+        owner[h] = s["id"]
+        dist[h] = 0
+        frontier.append((h, s["id"]))
+    t = 0
+    while frontier:
+        t += 1
+        nxt: List[Tuple[Point, str]] = []
+        claims: Dict[Point, str] = {}
+        for (x, y), sid in frontier:
+            if owner.get((x, y), sid) != sid:
+                continue  # cell was stolen by a tie-break; don't expand from it
+            for dx, dy in DIRECTIONS.values():
+                p = (x + dx, y + dy)
+                if not (0 <= p[0] < W and 0 <= p[1] < H):
+                    continue
+                if free_at.get(p, 0) > t:
+                    continue
+                if p in dist and dist[p] < t:
+                    continue  # already owned earlier
+                prev = claims.get(p)
+                if prev is None:
+                    if p not in dist or dist[p] == t:
+                        claims[p] = sid
+                elif prev != sid and prev != "__void__":
+                    # Same-turn contest: longer snake takes it, equal -> void.
+                    if lengths[sid] > lengths[prev]:
+                        claims[p] = sid
+                    elif lengths[sid] == lengths[prev]:
+                        claims[p] = "__void__"
+        for p, sid in claims.items():
+            if p in dist and dist[p] < t:
+                continue
+            dist[p] = t
+            owner[p] = sid
+            if sid != "__void__":
+                nxt.append((p, sid))
+        frontier = nxt
+
+    mine = sum(1 for o in owner.values() if o == my_id)
+    theirs = sum(1 for o in owner.values() if o != my_id and o != "__void__")
+    return mine, theirs
 
 
 # ---------------------------------------------------------------------------
@@ -408,9 +536,9 @@ def _greedy_score(state: Dict, my_id: str, vec: Point, blocked: Set[Point]) -> f
     nxt = (head[0] + vec[0], head[1] + vec[1])
     if not (0 <= nxt[0] < W and 0 <= nxt[1] < H) or nxt in blocked:
         return float("-inf")
-    space = _flood_fill(nxt, blocked, W, H, cap=W * H)
-    score = space * SPACE_WEIGHT
-    if space <= my_len:
+    space, tail_ok = _tfill(nxt, _free_at(state), W, H, tail=me["body"][-1])
+    score = space * (SPACE_WEIGHT * 3)
+    if space <= my_len and not tail_ok:
         score -= TRAP_PENALTY
     # Head-to-head shaping.
     for s in state["snakes"]:
