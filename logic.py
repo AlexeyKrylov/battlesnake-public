@@ -32,6 +32,9 @@ DIRECTIONS: Dict[str, Point] = {
     "left": (-1, 0),
     "right": (1, 0),
 }
+# Same deltas as DIRECTIONS.values(), as a plain tuple -- used in the hot
+# BFS/flood-fill loops below to skip repeated dict-view iteration overhead.
+_DELTAS: Tuple[Point, ...] = tuple(DIRECTIONS.values())
 
 # --- Search tuning ------------------------------------------------------
 
@@ -80,7 +83,7 @@ class Snake:
 
 
 class State:
-    __slots__ = ("width", "height", "snakes", "food", "turn")
+    __slots__ = ("width", "height", "snakes", "food", "turn", "_occ_cache", "_danger_cache")
 
     def __init__(self, width: int, height: int, snakes: Dict[str, Snake], food: Set[Point], turn: int):
         self.width = width
@@ -88,6 +91,8 @@ class State:
         self.snakes = snakes
         self.food = food
         self.turn = turn
+        self._occ_cache: Optional[Set[Point]] = None
+        self._danger_cache: Dict[str, Set[Point]] = {}
 
     def copy(self) -> "State":
         return State(
@@ -130,18 +135,31 @@ def _occupied_no_tails(state: State) -> Set[Point]:
     """Blocked cells for space/BFS estimates, optimistically treating every
     snake's tail as about to vacate (standard, slightly-optimistic convention
     used for space-control heuristics, not for authoritative collision
-    resolution -- see :func:`apply_round`)."""
-    occ: Set[Point] = set()
-    for s in state.snakes.values():
-        if not s.alive:
-            continue
-        occ.update(s.body[:-1])
-    return occ
+    resolution -- see :func:`apply_round`).
+
+    Cached on the state: this is recomputed many times per search node (move
+    ordering for me, for each modeled threat, for every greedily-advanced
+    other snake, plus the leaf evaluation) and only actually changes when
+    ``apply_round`` produces a new state, so memoizing it here is a large,
+    safe win for node throughput within the fixed time budget.
+    """
+    if state._occ_cache is None:
+        occ: Set[Point] = set()
+        for s in state.snakes.values():
+            if not s.alive:
+                continue
+            occ.update(s.body[:-1])
+        state._occ_cache = occ
+    return state._occ_cache
 
 
 def _head_to_head_danger_cells(state: State, sid: str) -> Set[Point]:
     """Cells adjacent to an enemy head that is >= ``sid``'s length -- moving
-    onto one risks a head-to-head loss/tie."""
+    onto one risks a head-to-head loss/tie. Cached per (state, sid), same
+    rationale as :func:`_occupied_no_tails`."""
+    cached = state._danger_cache.get(sid)
+    if cached is not None:
+        return cached
     me = state.snakes[sid]
     danger: Set[Point] = set()
     for other in state.snakes.values():
@@ -150,13 +168,21 @@ def _head_to_head_danger_cells(state: State, sid: str) -> Set[Point]:
         if other.length < me.length:
             continue
         eh = other.body[0]
-        for dx, dy in DIRECTIONS.values():
+        for dx, dy in _DELTAS:
             danger.add((eh[0] + dx, eh[1] + dy))
+    state._danger_cache[sid] = danger
     return danger
 
 
 def _flood_fill(start: Point, occupied: Set[Point], width: int, height: int, limit: int) -> int:
-    """Count open cells reachable from ``start`` (capped at ``limit``)."""
+    """Count open cells reachable from ``start`` (capped at ``limit``).
+
+    Bounds checks are inlined (not calling :func:`_in_bounds`) and deltas
+    come from the precomputed ``_DELTAS`` tuple -- this runs at every search
+    node and every leaf evaluation, so avoiding per-neighbor function-call
+    overhead is a meaningful win for total node throughput within the fixed
+    time budget.
+    """
     if start in occupied:
         return 0
     seen: Set[Point] = {start}
@@ -167,17 +193,19 @@ def _flood_fill(start: Point, occupied: Set[Point], width: int, height: int, lim
         count += 1
         if count >= limit:
             break
-        for dx, dy in DIRECTIONS.values():
-            nbr = (x + dx, y + dy)
-            if nbr in seen or not _in_bounds(nbr, width, height) or nbr in occupied:
-                continue
-            seen.add(nbr)
-            stack.append(nbr)
+        for dx, dy in _DELTAS:
+            nx, ny = x + dx, y + dy
+            nbr = (nx, ny)
+            if 0 <= nx < width and 0 <= ny < height and nbr not in seen and nbr not in occupied:
+                seen.add(nbr)
+                stack.append(nbr)
     return count
 
 
 def _bfs_dist(sources: List[Point], blocked: Set[Point], width: int, height: int) -> Dict[Point, int]:
-    """Shortest free-cell distances from any of ``sources``."""
+    """Shortest free-cell distances from any of ``sources``. Hottest single
+    function in the search (Voronoi eval runs it twice per leaf) -- see
+    :func:`_flood_fill` for why the bounds check is inlined here too."""
     dist: Dict[Point, int] = {}
     dq = deque()
     for src in sources:
@@ -186,11 +214,12 @@ def _bfs_dist(sources: List[Point], blocked: Set[Point], width: int, height: int
             dq.append(src)
     while dq:
         x, y = dq.popleft()
-        d = dist[(x, y)]
-        for dx, dy in DIRECTIONS.values():
-            nb = (x + dx, y + dy)
-            if _in_bounds(nb, width, height) and nb not in blocked and nb not in dist:
-                dist[nb] = d + 1
+        d = dist[(x, y)] + 1
+        for dx, dy in _DELTAS:
+            nx, ny = x + dx, y + dy
+            nb = (nx, ny)
+            if 0 <= nx < width and 0 <= ny < height and nb not in blocked and nb not in dist:
+                dist[nb] = d
                 dq.append(nb)
     return dist
 
@@ -227,17 +256,18 @@ def self_safe_moves(state: State, sid: str) -> List[str]:
     return out or list(DIRECTIONS.keys())
 
 
-def score_move(state: State, sid: str, move: str) -> float:
+def score_move(
+    state: State, sid: str, move: str, occ_no_tails: Set[Point], danger: Set[Point]
+) -> float:
     """Cheap single-ply score for ``move``, used for move ordering and as
-    the greedy policy for non-primary-threat enemies."""
+    the greedy policy for non-primary-threat enemies. Takes the occupancy
+    and danger sets as arguments -- they're the same for every candidate
+    move from a given state/snake, so callers compute them once."""
     s = state.snakes[sid]
     width, height = state.width, state.height
     head = s.body[0]
     dx, dy = DIRECTIONS[move]
     nxt = (head[0] + dx, head[1] + dy)
-
-    occ_no_tails = _occupied_no_tails(state)
-    danger = _head_to_head_danger_cells(state, sid)
 
     score = float(_flood_fill(nxt, occ_no_tails, width, height, limit=s.length + 1))
     if nxt in danger:
@@ -251,7 +281,9 @@ def score_move(state: State, sid: str, move: str) -> float:
 def order_moves(state: State, sid: str, moves: List[str]) -> List[str]:
     if len(moves) <= 1:
         return moves
-    scored = [(score_move(state, sid, mv), mv) for mv in moves]
+    occ_no_tails = _occupied_no_tails(state)
+    danger = _head_to_head_danger_cells(state, sid)
+    scored = [(score_move(state, sid, mv, occ_no_tails, danger), mv) for mv in moves]
     scored.sort(key=lambda t: t[0], reverse=True)
     return [mv for _, mv in scored]
 
@@ -433,6 +465,14 @@ def evaluate(state: State, my_id: str, threat_ids: List[str]) -> float:
             weight = 20.0
         elif me.health < HUNGRY_THRESHOLD:
             weight = 5.0
+        elif ref_enemy is not None and ref_enemy.length >= me.length:
+            # Not hungry, but tied (or behind) in length against the enemy
+            # we care most about -- a forced equal-length head-to-head is a
+            # coin flip that kills us too, so it's worth a mild detour for
+            # food now to be the longer snake if a trade becomes unavoidable
+            # later. Below the hungry threshold this is already covered by
+            # the higher weights above.
+            weight = 3.0
         else:
             weight = 0.5
         score += (width + height - nearest) * weight
