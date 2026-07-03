@@ -34,11 +34,6 @@ TIME_BUDGET = 0.20          # default when latency is unknown
 BUDGET_MIN = 0.08
 BUDGET_MAX = 0.25
 ENGINE_DEADLINE = 0.40      # target: full round trip stays under this
-# When a missed deadline is HARMLESS (the engine substitutes "up" and up is
-# strictly safe right now), we can afford to think longer and sail closer to
-# the 500 ms limit.
-RELAXED_MAX = 0.35
-RELAXED_DEADLINE = 0.47
 MAX_DEPTH = 8  # iterative deepening rarely reaches this; the clock stops us
 
 # --- Leaf-evaluation weights ------------------------------------------------
@@ -72,7 +67,7 @@ def get_info() -> Dict[str, str]:
         "color": "#000000",
         "head": "smart-caterpillar",
         "tail": "weight",
-        "version": "4.2.0",
+        "version": "4.1.0",
     }
 
 
@@ -83,30 +78,25 @@ def get_info() -> Dict[str, str]:
 _budgets: Dict[str, float] = {}  # per-game: concurrent games must not mix
 
 
-def _adaptive_budget(game_state: Dict, relaxed: bool = False) -> float:
+def _adaptive_budget(game_state: Dict) -> float:
     """Shrink the think time when the engine reports high round-trip latency.
 
     Reported latency ~= our previous think time + network overhead, so the
     overhead estimate is (latency - this game's previous budget). State is
     keyed by game id: two concurrent games sharing one budget would inflate
     each other's estimates past the 500 ms engine limit.
-
-    ``relaxed=True`` means a missed deadline is survivable this turn (the
-    engine's substitute move "up" is strictly safe), so we think longer.
     """
     gid = str((game_state.get("game") or {}).get("id") or "?")
     prev = _budgets.get(gid, TIME_BUDGET)
-    cap = RELAXED_MAX if relaxed else BUDGET_MAX
-    target = RELAXED_DEADLINE if relaxed else ENGINE_DEADLINE
     try:
         lat_ms = float(game_state["you"].get("latency") or 0)
     except Exception:
         lat_ms = 0.0
     if lat_ms <= 0:
-        budget = min(prev, cap) if not relaxed else max(prev, TIME_BUDGET)
+        budget = prev
     else:
         overhead = max(0.0, lat_ms / 1000.0 - prev)
-        budget = max(BUDGET_MIN, min(cap, target - overhead))
+        budget = max(BUDGET_MIN, min(BUDGET_MAX, ENGINE_DEADLINE - overhead))
     if len(_budgets) > 64:  # bound memory across many games
         _budgets.clear()
     _budgets[gid] = budget
@@ -118,17 +108,7 @@ def choose_move(game_state: Dict) -> str:
     try:
         state = _parse(game_state)
         my_id = game_state["you"]["id"]
-        # If the engine's timeout substitute ("up") is strictly safe right
-        # now, a missed deadline costs us nothing — think longer.
-        relaxed = False
-        try:
-            me = _find(state, my_id)
-            head = me["body"][0]
-            cons = _conservative_blocked(state, my_id)
-            relaxed = _move_tier(state, my_id, (head[0], head[1] + 1), cons) == 0
-        except Exception:
-            relaxed = False
-        move = _search_root(state, my_id, _adaptive_budget(game_state, relaxed))
+        move = _search_root(state, my_id, _adaptive_budget(game_state))
     except Exception:
         pass
     if move is None:
